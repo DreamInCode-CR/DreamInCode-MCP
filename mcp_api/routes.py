@@ -233,7 +233,6 @@ def configurar_rutas(app):
             "items": items
         })
 
-   # Generar recordatorio TTS (WAV/MP3 según disponibilidad del SDK)
   # Generar recordatorio TTS (WAV/MP3 según disponibilidad del SDK)
     @api.post("/reminder_tts")
     def reminder_tts():
@@ -291,13 +290,14 @@ def configurar_rutas(app):
                     "audio_base64": base64.b64encode(audio_bytes).decode("utf-8"),
                 })
 
-            # Enviar como archivo, igual que en /voice_mcp
+          # Enviar como archivo, igual que /voice_mcp, con nombre estable
             ext = "wav" if mime == "audio/wav" else "mp3"
+
             resp = send_file(
                 io.BytesIO(audio_bytes),
                 mimetype=(mime or "audio/wav"),
-                as_attachment=False,
-                download_name=f"reminder.{ext}",
+                as_attachment=True,                         # << fuerza descarga con nombre
+                download_name=f"reminder.{ext}",            # << pone extensión correcta
             )
 
             # (opcional) conservar tus cabeceras X-*
@@ -307,7 +307,6 @@ def configurar_rutas(app):
             resp.headers["X-Hora"] = hora
 
             return resp
-
         except Exception as e:
             app.logger.exception("reminder_tts failed")
             return jsonify(error="reminder_tts_failed", detail=str(e)), 500
