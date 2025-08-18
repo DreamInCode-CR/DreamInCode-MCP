@@ -51,24 +51,32 @@ def configurar_rutas(app):
         return resp.text
 
     def synthesize_wav(texto: str, voice: str | None = None) -> bytes:
-        """TTS: texto -> WAV (sin ffmpeg)."""
+        """
+        TTS a WAV sin usar ffmpeg/pydub y compatible con openai==1.98.0.
+        Usa `responses.create(..., audio={"voice": ..., "format": "wav"})`
+        y decodifica base64.
+        """
         v = voice or VOICE
-        with client.audio.speech.with_streaming_response.create(
+        r = client.responses.create(
             model=TTS_MODEL,
-            voice=v,
             input=texto,
-            format="wav",
-        ) as r:
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            modalities=["text", "audio"],
+            audio={"voice": v, "format": "wav"},
+        )
+
+        # Distintas estructuras posibles del SDK; extraemos el audio base64 de forma robusta
+        audio_b64 = getattr(r, "output_audio", None)
+        if not audio_b64:
             try:
-                r.stream_to_file(tmp.name)
-                with open(tmp.name, "rb") as f:
-                    return f.read()
-            finally:
+                audio_b64 = r.output[0].content[0].audio.data
+            except Exception:
                 try:
-                    os.remove(tmp.name)
+                    audio_b64 = r.choices[0].message.audio.data
                 except Exception:
-                    pass
+                    raise RuntimeError("No se encontró audio en la respuesta de TTS")
+
+        return base64.b64decode(audio_b64)
+
 
     # -------------------- Rutas --------------------
     @api.get("/")
@@ -127,7 +135,7 @@ def configurar_rutas(app):
 
         audio_file = request.files["audio"]
         usuario_id = request.form.get("usuario_id")
-        retorno    = (request.form.get("return") or "audio").lower()
+        retorno = ((request.form.get("return") or "audio").strip().lower())
 
         try:
             texto = transcribir_audio(audio_file)
