@@ -52,6 +52,10 @@ jobs:
           test -f "$STAGING/application.py" || (echo "::error::No se encontró application.py en la raíz" && exit 1)
           test -d "$STAGING/mcp_api" || (echo "::error::No se encontró la carpeta 'mcp_api/'" && exit 1)
           test -f "$STAGING/requirements.txt" || (echo "::error::No se encontró requirements.txt" && exit 1)
+          
+          if ! grep -q "gunicorn" "$STAGING/requirements.txt"; then
+            echo "gunicorn==21.2.0" >> "$STAGING/requirements.txt"
+          fi
 
           # Empaqueta lo limpio
           cd "$STAGING"
