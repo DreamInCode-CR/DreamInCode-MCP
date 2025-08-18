@@ -6,21 +6,80 @@ from datetime import datetime, timedelta, timezone
 
 from flask import request, jsonify, Response
 from openai import OpenAI
+import io  # (quedó uno solo, se eliminó el duplicado)
 
 from mcp.database import get_due_meds
 from mcp.core import procesar_mensaje
 from mcp.context import build_system_prompt
 
+
 # ---------- OpenAI client y defaults ----------
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-STT_MODEL  = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")  
-TTS_MODEL  = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")         
+STT_MODEL  = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+TTS_MODEL  = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 VOICE      = os.getenv("OPENAI_VOICE", "alloy")
-TTS_FORMAT = os.getenv("OPENAI_TTS_FORMAT", "wav")                   
+TTS_FORMAT = os.getenv("OPENAI_TTS_FORMAT", "wav")
 
 
-# ---------- Helpers (modulo) ----------
+# ---------- TTS: garantiza WAV sin usar ffmpeg/pydub ----------
+def synthesize_wav(texto: str, voice: str):
+    """
+    Devuelve (audio_bytes, 'audio/wav') **sin** usar ffmpeg/pydub.
+    Estrategia:
+      1) Intentar audio.speech.create(format='wav')
+      2) Fallback: responses.create(..., audio={"format":"wav"}) y decodificar base64
+    """
+    # 1) Intento directo (SDKs que aceptan format="wav")
+    try:
+        r = client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=voice,
+            input=texto,
+            format="wav",  # clave: pedimos WAV directamente
+        )
+        return r.read(), "audio/wav"
+    except TypeError:
+        # Algunas versiones antiguas no aceptan el parámetro format
+        pass
+    except Exception:
+        # Cualquier otro error: probamos el fallback
+        pass
+
+    # 2) Fallback: API 'responses' con salida de audio en base64 WAV (SDKs modernos)
+    try:
+        r = client.responses.create(
+            model=TTS_MODEL,
+            input=texto,
+            modalities=["text", "audio"],
+            audio={"voice": voice, "format": "wav"},
+        )
+
+        # Extraer el audio base64 según la forma del SDK
+        audio_b64 = None
+        if hasattr(r, "output_audio"):  # algunos SDKs exponen esto directamente
+            audio_b64 = r.output_audio
+        elif getattr(r, "output", None):
+            try:
+                audio_b64 = r.output[0].content[0].audio.data
+            except Exception:
+                audio_b64 = None
+        elif getattr(r, "choices", None):
+            try:
+                audio_b64 = r.choices[0].message.audio.data
+            except Exception:
+                audio_b64 = None
+
+        if not audio_b64:
+            raise RuntimeError("No se encontró audio en la respuesta de 'responses'.")
+
+        return base64.b64decode(audio_b64), "audio/wav"
+    except Exception as e:
+        # Si también falla el fallback, propagamos un error claro
+        raise RuntimeError(f"No se pudo sintetizar TTS en WAV: {e}") from e
+
+
+# ---------- Helpers (módulo) ----------
 def _get_usuario_id(payload) -> int:
     """Acepta 'usuario_id' o 'UsuarioID'. Por defecto 3."""
     return int(payload.get("usuario_id") or payload.get("UsuarioID") or 3)
@@ -137,17 +196,10 @@ def configurar_rutas(app):
                     "respuesta": respuesta_texto
                 })
 
-            # 3) TTS
-            speech = client.audio.speech.create(
-                model=TTS_MODEL,
-                voice=VOICE,
-                input=respuesta_texto,
-                format=TTS_FORMAT
-            )
-            audio_bytes = speech.read()
+            # 3) TTS -> WAV garantizado (sin ffmpeg)
+            audio_bytes, mimetype = synthesize_wav(respuesta_texto, VOICE)
 
-            mimetype = "audio/wav" if TTS_FORMAT.lower() == "wav" else "audio/mpeg"
-            filename = f"respuesta.{ 'wav' if TTS_FORMAT.lower()=='wav' else 'mp3' }"
+            filename = "respuesta.wav"
             headers = {
                 "Content-Disposition": f'inline; filename="{filename}"',
                 "X-Usuario-Id": str(usuario_id)
@@ -160,7 +212,6 @@ def configurar_rutas(app):
             except Exception:
                 pass
 
-    # --- Sólo TTS: texto -> audio ---
     @app.post("/tts")
     def tts():
         data = request.get_json(silent=True) or {}
@@ -169,22 +220,14 @@ def configurar_rutas(app):
             return jsonify(error="Falta 'texto'"), 400
 
         voice = data.get("voice") or VOICE
-        fmt = (data.get("format") or TTS_FORMAT).lower()
 
-        speech = client.audio.speech.create(
-            model=TTS_MODEL,
-            voice=voice,
-            input=texto,
-            format=fmt
-        )
-        audio_bytes = speech.read()
-
-        mimetype = "audio/wav" if fmt == "wav" else "audio/mpeg"
-        filename = f"tts.{ 'wav' if fmt=='wav' else 'mp3' }"
+        # WAV garantizado (sin ffmpeg)
+        audio_bytes, mimetype = synthesize_wav(texto, voice)
+        filename = "tts.wav"
         return Response(
             audio_bytes,
             mimetype=mimetype,
-            headers={"Content-Disposition": f'inline; filename=\"{filename}\"'}
+            headers={"Content-Disposition": f'inline; filename="{filename}"'}
         )
 
     # --- (A) Qué medicamento toca ahora (JSON) ---
@@ -258,6 +301,7 @@ def configurar_rutas(app):
 
         texto = _build_spanish_reminder(nombre, medicamento, dosis, hora)
 
+        # Aquí seguimos respetando TTS_FORMAT (por si quieres MP3 en este endpoint)
         speech = client.audio.speech.create(
             model=TTS_MODEL,
             voice=VOICE,

@@ -39,3 +39,11 @@ def build_system_prompt(usuario_id: int) -> str:
     """).strip()
 
     return f"{base}\n\nPERFIL DEL USUARIO\n{perfil}\n"
+
+# --- Compatibilidad con código antiguo ---
+def cargar_contexto_basico(usuario_id: int) -> str:
+    """
+    Alias para mantener compatibilidad con módulos que aún importan
+    'cargar_contexto_basico'. Devuelve el mismo prompt que build_system_prompt.
+    """
+    return build_system_prompt(usuario_id)
