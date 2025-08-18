@@ -234,6 +234,7 @@ def configurar_rutas(app):
         })
 
    # Generar recordatorio TTS (WAV/MP3 según disponibilidad del SDK)
+  # Generar recordatorio TTS (WAV/MP3 según disponibilidad del SDK)
     @api.post("/reminder_tts")
     def reminder_tts():
         data = request.get_json(silent=True) or {}
@@ -266,10 +267,19 @@ def configurar_rutas(app):
             # Texto del recordatorio
             texto = _build_spanish_reminder(nombre, medicamento, dosis, hora)
 
-            # === TTS robusto (WAV si se puede, MP3 si no) ===
+            # Genera audio con preferencia **WAV**
             audio_bytes, mime = synthesize_wav(texto, VOICE)
 
-            # Respuesta en JSON con base64 (debug) si ?mode=json
+            # (opcional) segundo intento por si el SDK no entregó WAV a la primera
+            if mime != "audio/wav":
+                try:
+                    audio_bytes2, mime2 = synthesize_wav(texto, VOICE)
+                    if mime2 == "audio/wav":
+                        audio_bytes, mime = audio_bytes2, mime2
+                except Exception:
+                    pass
+
+            # ¿Modo JSON para depurar?
             if request.args.get("mode") == "json":
                 return jsonify({
                     "usuario_id": usuario_id,
@@ -278,20 +288,30 @@ def configurar_rutas(app):
                     "hora": hora,
                     "tts_texto": texto,
                     "audio_mime": mime,
-                    "audio_base64": base64.b64encode(audio_bytes).decode("utf-8")
+                    "audio_base64": base64.b64encode(audio_bytes).decode("utf-8"),
                 })
 
-            headers = {
-                "X-Usuario-Id": str(usuario_id) if usuario_id else "",
-                "X-Medicamento": medicamento,
-                "X-Dosis": dosis or "",
-                "X-Hora": hora,
-            }
-            return Response(audio_bytes, mimetype=mime, headers=headers)
+            # Enviar como archivo, igual que en /voice_mcp
+            ext = "wav" if mime == "audio/wav" else "mp3"
+            resp = send_file(
+                io.BytesIO(audio_bytes),
+                mimetype=(mime or "audio/wav"),
+                as_attachment=False,
+                download_name=f"reminder.{ext}",
+            )
+
+            # (opcional) conservar tus cabeceras X-*
+            resp.headers["X-Usuario-Id"] = str(usuario_id) if usuario_id else ""
+            resp.headers["X-Medicamento"] = medicamento
+            resp.headers["X-Dosis"] = dosis or ""
+            resp.headers["X-Hora"] = hora
+
+            return resp
 
         except Exception as e:
             app.logger.exception("reminder_tts failed")
             return jsonify(error="reminder_tts_failed", detail=str(e)), 500
+
 
     # <<< REGISTRO DEL BLUEPRINT (fuera de los handlers) >>>
     app.register_blueprint(api, url_prefix="/")
