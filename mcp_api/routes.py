@@ -51,16 +51,20 @@ def configurar_rutas(app):
         return resp.text
 
     def synthesize_wav(texto: str, voice: str | None = None):
-        """Genera audio. Intenta WAV nativo; si no, usa Responses; último recurso: MP3."""
+        """
+        Genera audio para `texto`. Intenta WAV primero usando audio.speech con `extra_body`.
+        Si no está soportado, hace fallback a MP3 (audio/mpeg).
+        Devuelve: (audio_bytes, mime)
+        """
         v = voice or VOICE
 
-        # 1) Speech streaming + 'format' vía extra_body (evita el TypeError del SDK)
+        # 1) Streaming + WAV via extra_body (evita 'format' como kwarg)
         try:
             with client.audio.speech.with_streaming_response.create(
                 model=TTS_MODEL,
                 voice=v,
                 input=texto,
-                extra_body={"format": "wav"},  # <- en vez de format="wav"
+                extra_body={"format": "wav"},   # <- clave: pedir WAV aquí
             ) as r:
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 try:
@@ -68,12 +72,14 @@ def configurar_rutas(app):
                     with open(tmp.name, "rb") as f:
                         return f.read(), "audio/wav"
                 finally:
-                    try: os.remove(tmp.name)
-                    except Exception: pass
+                    try:
+                        os.remove(tmp.name)
+                    except Exception:
+                        pass
         except Exception:
-            pass  # probamos la siguiente
+            pass  # probamos siguiente intento
 
-        # 2) Speech no streaming + 'format' vía extra_body
+        # 2) No-streaming + WAV via extra_body
         try:
             r = client.audio.speech.create(
                 model=TTS_MODEL,
@@ -85,40 +91,12 @@ def configurar_rutas(app):
         except Exception:
             pass
 
-        # 3) Responses API (sin 'modalities' posicional: lo metemos en extra_body)
-        try:
-            r = client.responses.create(
-                model=TTS_MODEL,
-                input=texto,
-                extra_body={
-                    "modalities": ["text", "audio"],
-                    "audio": {"voice": v, "format": "wav"},
-                },
-            )
-            # distintas formas de venir el audio en el SDK:
-            audio_b64 = getattr(r, "output_audio", None)
-            if not audio_b64 and getattr(r, "output", None):
-                try:
-                    for blk in r.output[0].content:
-                        t = getattr(blk, "type", "")
-                        if t in ("audio", "output_audio"):
-                            audio_b64 = blk.audio.data
-                            break
-                except Exception:
-                    audio_b64 = None
-            if not audio_b64 and getattr(r, "choices", None):
-                try:
-                    audio_b64 = r.choices[0].message.audio.data
-                except Exception:
-                    audio_b64 = None
-
-            if audio_b64:
-                return base64.b64decode(audio_b64), "audio/wav"
-        except Exception:
-            pass
-
-        # 4) Último recurso: sin formato (normalmente MP3). Devolvemos MP3.
-        r = client.audio.speech.create(model=TTS_MODEL, voice=v, input=texto)
+        # 3) Último recurso: sin formato (normalmente MP3)
+        r = client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=v,
+            input=texto,
+        )
         return r.read(), "audio/mpeg"
 
 
