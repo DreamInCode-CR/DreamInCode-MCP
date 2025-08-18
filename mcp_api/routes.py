@@ -50,32 +50,76 @@ def configurar_rutas(app):
         )
         return resp.text
 
-    def synthesize_wav(texto: str, voice: str | None = None) -> bytes:
-        """
-        TTS a WAV sin usar ffmpeg/pydub y compatible con openai==1.98.0.
-        Usa `responses.create(..., audio={"voice": ..., "format": "wav"})`
-        y decodifica base64.
-        """
+    def synthesize_wav(texto: str, voice: str | None = None):
+        """Genera audio. Intenta WAV nativo; si no, usa Responses; último recurso: MP3."""
         v = voice or VOICE
-        r = client.responses.create(
-            model=TTS_MODEL,
-            input=texto,
-            modalities=["text", "audio"],
-            audio={"voice": v, "format": "wav"},
-        )
 
-        # Distintas estructuras posibles del SDK; extraemos el audio base64 de forma robusta
-        audio_b64 = getattr(r, "output_audio", None)
-        if not audio_b64:
-            try:
-                audio_b64 = r.output[0].content[0].audio.data
-            except Exception:
+        # 1) Speech streaming + 'format' vía extra_body (evita el TypeError del SDK)
+        try:
+            with client.audio.speech.with_streaming_response.create(
+                model=TTS_MODEL,
+                voice=v,
+                input=texto,
+                extra_body={"format": "wav"},  # <- en vez de format="wav"
+            ) as r:
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                try:
+                    r.stream_to_file(tmp.name)
+                    with open(tmp.name, "rb") as f:
+                        return f.read(), "audio/wav"
+                finally:
+                    try: os.remove(tmp.name)
+                    except Exception: pass
+        except Exception:
+            pass  # probamos la siguiente
+
+        # 2) Speech no streaming + 'format' vía extra_body
+        try:
+            r = client.audio.speech.create(
+                model=TTS_MODEL,
+                voice=v,
+                input=texto,
+                extra_body={"format": "wav"},
+            )
+            return r.read(), "audio/wav"
+        except Exception:
+            pass
+
+        # 3) Responses API (sin 'modalities' posicional: lo metemos en extra_body)
+        try:
+            r = client.responses.create(
+                model=TTS_MODEL,
+                input=texto,
+                extra_body={
+                    "modalities": ["text", "audio"],
+                    "audio": {"voice": v, "format": "wav"},
+                },
+            )
+            # distintas formas de venir el audio en el SDK:
+            audio_b64 = getattr(r, "output_audio", None)
+            if not audio_b64 and getattr(r, "output", None):
+                try:
+                    for blk in r.output[0].content:
+                        t = getattr(blk, "type", "")
+                        if t in ("audio", "output_audio"):
+                            audio_b64 = blk.audio.data
+                            break
+                except Exception:
+                    audio_b64 = None
+            if not audio_b64 and getattr(r, "choices", None):
                 try:
                     audio_b64 = r.choices[0].message.audio.data
                 except Exception:
-                    raise RuntimeError("No se encontró audio en la respuesta de TTS")
+                    audio_b64 = None
 
-        return base64.b64decode(audio_b64)
+            if audio_b64:
+                return base64.b64decode(audio_b64), "audio/wav"
+        except Exception:
+            pass
+
+        # 4) Último recurso: sin formato (normalmente MP3). Devolvemos MP3.
+        r = client.audio.speech.create(model=TTS_MODEL, voice=v, input=texto)
+        return r.read(), "audio/mpeg"
 
 
     # -------------------- Rutas --------------------
@@ -135,48 +179,60 @@ def configurar_rutas(app):
 
         audio_file = request.files["audio"]
         usuario_id = request.form.get("usuario_id")
-        retorno = ((request.form.get("return") or "audio").strip().lower())
+        retorno = (request.form.get("return") or "audio").strip().lower()
 
+        # STT + LLM
         try:
             texto = transcribir_audio(audio_file)
-            # Usa tu LLM con contexto
             system = build_system_prompt(usuario_id)
             respuesta_texto = procesar_mensaje(texto, usuario_id, system_override=system)
         except Exception as e:
             app.logger.exception("Error en STT o LLM")
             return jsonify(error="processing_failed", detail=str(e)), 500
 
+        # Solo JSON (sin TTS) si lo piden
         if retorno == "json":
             return jsonify({"transcript": texto, "reply": respuesta_texto})
 
+        # TTS -> audio (WAV preferido; MP3 si no hay otra)
         try:
-            wav_bytes = synthesize_wav(respuesta_texto)
+            audio_bytes, mime = synthesize_wav(respuesta_texto)
         except Exception as e:
             app.logger.exception("Error en TTS")
             return jsonify(error="tts_failed", detail=str(e)), 500
 
+        ext = "wav" if mime == "audio/wav" else "mp3"
         return send_file(
-            io.BytesIO(wav_bytes),
-            mimetype="audio/wav",
+            io.BytesIO(audio_bytes),
+            mimetype=mime,
             as_attachment=False,
-            download_name="reply.wav",
+            download_name=f"reply.{ext}",
         )
+
+
 
     # Texto -> TTS directo
     @api.post("/tts")
     def tts():
-        data = request.get_json(silent=True) or {}
-        texto = (data.get("texto") or "").strip()
-        if not texto:
-            return jsonify(error="Falta 'texto'"), 400
-        voice = data.get("voice") or VOICE
-        audio_bytes = synthesize_wav(texto, voice)
-        return Response(
-            audio_bytes,
-            mimetype="audio/wav",
-            headers={"Content-Disposition": 'inline; filename="tts.wav"'}
-        )
+            data = request.get_json(silent=True) or {}
+            texto = (data.get("texto") or "").strip()
+            if not texto:
+                return jsonify(error="Falta 'texto'"), 400
 
+            voice = data.get("voice") or VOICE
+
+            try:
+                audio_bytes, mime = synthesize_wav(texto, voice)
+            except Exception as e:
+                app.logger.exception("Error en TTS")
+                return jsonify(error="tts_failed", detail=str(e)), 500
+
+            ext = "wav" if mime == "audio/wav" else "mp3"
+            return Response(
+                audio_bytes,
+                mimetype=mime,
+                headers={"Content-Disposition": f'inline; filename="tts.{ext}"'}
+            )
     # Qué medicamento toca ahora (JSON)
     @api.get("/meds/due")
     def meds_due():
