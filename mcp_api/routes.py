@@ -1,144 +1,106 @@
-# mcp_api/routes.py
+# mcp_api/routes.py  (versión unificada)
 import os
-import tempfile
+import io
 import base64
+import tempfile
 from datetime import datetime, timedelta, timezone
 
-from flask import request, jsonify, Response
+from flask import Blueprint, request, jsonify, Response, send_file
 from openai import OpenAI
-import io  # (quedó uno solo, se eliminó el duplicado)
 
+# Tu lógica propia
 from mcp.database import get_due_meds
-from mcp.core import procesar_mensaje
-from mcp.context import build_system_prompt
+from mcp.core import procesar_mensaje           # Mantén tu implementación
+from mcp.context import build_system_prompt     # Mantén tu system prompt
 
-
-# ---------- OpenAI client y defaults ----------
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-STT_MODEL  = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
-TTS_MODEL  = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-VOICE      = os.getenv("OPENAI_VOICE", "alloy")
-TTS_FORMAT = os.getenv("OPENAI_TTS_FORMAT", "wav")
-
-
-# ---------- TTS: garantiza WAV sin usar ffmpeg/pydub ----------
-def synthesize_wav(texto: str, voice: str):
-    """
-    Devuelve (audio_bytes, 'audio/wav') **sin** usar ffmpeg/pydub.
-    Estrategia:
-      1) Intentar audio.speech.create(format='wav')
-      2) Fallback: responses.create(..., audio={"format":"wav"}) y decodificar base64
-    """
-    # 1) Intento directo (SDKs que aceptan format="wav")
-    try:
-        r = client.audio.speech.create(
-            model=TTS_MODEL,
-            voice=voice,
-            input=texto,
-            format="wav",  # clave: pedimos WAV directamente
-        )
-        return r.read(), "audio/wav"
-    except TypeError:
-        # Algunas versiones antiguas no aceptan el parámetro format
-        pass
-    except Exception:
-        # Cualquier otro error: probamos el fallback
-        pass
-
-    # 2) Fallback: API 'responses' con salida de audio en base64 WAV (SDKs modernos)
-    try:
-        r = client.responses.create(
-            model=TTS_MODEL,
-            input=texto,
-            modalities=["text", "audio"],
-            audio={"voice": voice, "format": "wav"},
-        )
-
-        # Extraer el audio base64 según la forma del SDK
-        audio_b64 = None
-        if hasattr(r, "output_audio"):  # algunos SDKs exponen esto directamente
-            audio_b64 = r.output_audio
-        elif getattr(r, "output", None):
-            try:
-                audio_b64 = r.output[0].content[0].audio.data
-            except Exception:
-                audio_b64 = None
-        elif getattr(r, "choices", None):
-            try:
-                audio_b64 = r.choices[0].message.audio.data
-            except Exception:
-                audio_b64 = None
-
-        if not audio_b64:
-            raise RuntimeError("No se encontró audio en la respuesta de 'responses'.")
-
-        return base64.b64decode(audio_b64), "audio/wav"
-    except Exception as e:
-        # Si también falla el fallback, propagamos un error claro
-        raise RuntimeError(f"No se pudo sintetizar TTS en WAV: {e}") from e
-
-
-# ---------- Helpers (módulo) ----------
-def _get_usuario_id(payload) -> int:
-    """Acepta 'usuario_id' o 'UsuarioID'. Por defecto 3."""
-    return int(payload.get("usuario_id") or payload.get("UsuarioID") or 3)
-
-
-def _now_with_offset(offset_min: int | None) -> datetime:
-    """Devuelve ahora en UTC + offset en minutos (si se envía)."""
-    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-    if offset_min is None:
-        return now_utc
-    return now_utc + timedelta(minutes=offset_min)
-
-
-def _build_spanish_reminder(nombre: str | None, medicamento: str, dosis: str | None, hora: str) -> str:
-    """Texto de recordatorio en español para TTS."""
-    quien = f"{nombre}, " if nombre else ""
-    dosis_txt = f" {dosis}" if dosis else ""
-    return f"Hola {quien}es la hora de tomar {medicamento}{dosis_txt}. Son las {hora}. Por favor tómala con cuidado."
-
-
-# ---------- Registro de rutas ----------
 def configurar_rutas(app):
+    api = Blueprint("api", __name__)
 
-    # --- ping ---
-    @app.get("/")
+    # -------- Config desde variables de entorno (Azure App Settings) --------
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    CHAT_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    STT_MODEL      = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+    TTS_MODEL      = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+    TTS_FORMAT     = os.getenv("OPENAI_TTS_FORMAT", "wav")
+    VOICE          = os.getenv("OPENAI_VOICE", "alloy")
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # -------------------- Helpers --------------------
+    def _get_usuario_id(payload) -> int:
+        return int(payload.get("usuario_id") or payload.get("UsuarioID") or 3)
+
+    def _now_with_offset(offset_min: int | None) -> datetime:
+        now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        return now_utc if offset_min is None else now_utc + timedelta(minutes=offset_min)
+
+    def _build_spanish_reminder(nombre: str | None, medicamento: str, dosis: str | None, hora: str) -> str:
+        quien = f"{nombre}, " if nombre else ""
+        dosis_txt = f" {dosis}" if dosis else ""
+        return f"Hola {quien}es la hora de tomar {medicamento}{dosis_txt}. Son las {hora}. Por favor tómala con cuidado."
+
+    def transcribir_audio(file_storage) -> str:
+        """STT: archivo (werkzeug FileStorage) -> texto."""
+        data = file_storage.read()
+        filename = file_storage.filename or "audio.wav"
+        mimetype = file_storage.mimetype or "audio/wav"
+        resp = client.audio.transcriptions.create(
+            model=STT_MODEL,
+            file=(filename, data, mimetype),
+        )
+        return resp.text
+
+    def synthesize_wav(texto: str, voice: str | None = None) -> bytes:
+        """TTS: texto -> WAV (sin ffmpeg)."""
+        v = voice or VOICE
+        with client.audio.speech.with_streaming_response.create(
+            model=TTS_MODEL,
+            voice=v,
+            input=texto,
+            format="wav",
+        ) as r:
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            try:
+                r.stream_to_file(tmp.name)
+                with open(tmp.name, "rb") as f:
+                    return f.read()
+            finally:
+                try:
+                    os.remove(tmp.name)
+                except Exception:
+                    pass
+
+    # -------------------- Rutas --------------------
+    @api.get("/")
     def home():
         return "DreamInCode API OK"
 
-    @app.get("/health")
+    @api.get("/health")
     def health():
-        return jsonify(status="ok", service="api")
+        return jsonify({"status": "ok", "service": "api"})
 
-    # --- Texto -> respuesta  ---
-    @app.post("/mcp")
+    # Texto -> respuesta (usa tu procesar_mensaje)
+    @api.post("/mcp")
     def mcp():
         data = request.get_json(silent=True) or {}
-        mensaje_usuario = data.get("mensaje", "") or ""
+        mensaje_usuario = (data.get("mensaje") or "").strip()
         usuario_id = _get_usuario_id(data)
-
-        # Inyecta contexto del usuario en el system prompt
         system = build_system_prompt(usuario_id)
-
-        # Tu función debe aceptar system_override=system
+        # Tu procesar_mensaje debe soportar system_override si quieres inyectarlo:
         respuesta = procesar_mensaje(mensaje_usuario, usuario_id, system_override=system)
         return jsonify({"respuesta": respuesta})
 
-    # --- SOLO STT: voz -> texto ---
-    @app.post("/stt")
+    # Solo STT
+    @api.post("/stt")
     def stt():
         if "audio" not in request.files:
             return jsonify(error="Sube el archivo en form-data con la clave 'audio'"), 400
 
-        # (opcional) campos extra
         _ = int(request.form.get("usuario_id") or request.form.get("UsuarioID") or 3)
-        lang = request.form.get("lang")  # ej. "es"
+        lang = request.form.get("lang")  # opcional
 
         f = request.files["audio"]
         suffix = os.path.splitext(f.filename or "")[1] or ".wav"
-
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             f.save(tmp.name)
             tmp_path = tmp.name
@@ -157,88 +119,59 @@ def configurar_rutas(app):
             except Exception:
                 pass
 
-    # --- Flujo completo: voz -> texto -> MCP -> TTS -> audio ---
-    @app.post("/voice_mcp")
+    # Flujo completo: voz -> texto -> MCP -> TTS
+    @api.post("/voice_mcp")
     def voice_mcp():
         if "audio" not in request.files:
-            return jsonify(error="Sube el archivo en form-data con la clave 'audio'"), 400
+            return jsonify(error="faltó 'audio' en form-data"), 400
 
-        usuario_id = int(request.form.get("usuario_id") or request.form.get("UsuarioID") or 3)
-        lang = request.form.get("lang")
-        return_mode = (request.form.get("return") or "").lower()
-
-        f = request.files["audio"]
-        suffix = os.path.splitext(f.filename or "")[1] or ".wav"
-
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            f.save(tmp.name)
-            tmp_path = tmp.name
+        audio_file = request.files["audio"]
+        usuario_id = request.form.get("usuario_id")
+        retorno    = (request.form.get("return") or "audio").lower()
 
         try:
-            # 1) STT
-            with open(tmp_path, "rb") as audio_file:
-                tr = client.audio.transcriptions.create(
-                    model=STT_MODEL,
-                    file=audio_file,
-                    language=lang
-                )
-            texto = tr.text or ""
-
-            # 2) Contexto y MCP
+            texto = transcribir_audio(audio_file)
+            # Usa tu LLM con contexto
             system = build_system_prompt(usuario_id)
             respuesta_texto = procesar_mensaje(texto, usuario_id, system_override=system)
+        except Exception as e:
+            app.logger.exception("Error en STT o LLM")
+            return jsonify(error="processing_failed", detail=str(e)), 500
 
-            # Opcional para depurar
-            if return_mode == "json":
-                return jsonify({
-                    "usuario_id": usuario_id,
-                    "transcripcion": texto,
-                    "respuesta": respuesta_texto
-                })
+        if retorno == "json":
+            return jsonify({"transcript": texto, "reply": respuesta_texto})
 
-            # 3) TTS -> WAV garantizado (sin ffmpeg)
-            audio_bytes, mimetype = synthesize_wav(respuesta_texto, VOICE)
+        try:
+            wav_bytes = synthesize_wav(respuesta_texto)
+        except Exception as e:
+            app.logger.exception("Error en TTS")
+            return jsonify(error="tts_failed", detail=str(e)), 500
 
-            filename = "respuesta.wav"
-            headers = {
-                "Content-Disposition": f'inline; filename="{filename}"',
-                "X-Usuario-Id": str(usuario_id)
-            }
-            return Response(audio_bytes, mimetype=mimetype, headers=headers)
+        return send_file(
+            io.BytesIO(wav_bytes),
+            mimetype="audio/wav",
+            as_attachment=False,
+            download_name="reply.wav",
+        )
 
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-    @app.post("/tts")
+    # Texto -> TTS directo
+    @api.post("/tts")
     def tts():
         data = request.get_json(silent=True) or {}
         texto = (data.get("texto") or "").strip()
         if not texto:
             return jsonify(error="Falta 'texto'"), 400
-
         voice = data.get("voice") or VOICE
-
-        # WAV garantizado (sin ffmpeg)
-        audio_bytes, mimetype = synthesize_wav(texto, voice)
-        filename = "tts.wav"
+        audio_bytes = synthesize_wav(texto, voice)
         return Response(
             audio_bytes,
-            mimetype=mimetype,
-            headers={"Content-Disposition": f'inline; filename="{filename}"'}
+            mimetype="audio/wav",
+            headers={"Content-Disposition": 'inline; filename="tts.wav"'}
         )
 
-    # --- (A) Qué medicamento toca ahora (JSON) ---
-    @app.get("/meds/due")
+    # Qué medicamento toca ahora (JSON)
+    @api.get("/meds/due")
     def meds_due():
-        """
-        Params:
-          - usuario_id: int (requerido)
-          - window_min: int (opcional, default 5)
-          - tz_offset_min: int (opcional) minutos vs UTC (p.ej. -240)
-        """
         try:
             usuario_id = int(request.args.get("usuario_id"))
         except (TypeError, ValueError):
@@ -258,21 +191,9 @@ def configurar_rutas(app):
             "items": items
         })
 
-    # --- (B) Generar recordatorio TTS (WAV/MP3) ---
-    @app.post("/reminder_tts")
+    # Generar recordatorio TTS (WAV/MP3 configurable por TTS_FORMAT)
+    @api.post("/reminder_tts")
     def reminder_tts():
-        """
-        Body JSON:
-          - usuario_id (int, opcional)
-          - medicamento (string, requerido si no se usa 'auto')
-          - dosis (string, opcional)
-          - hora (HH:mm, requerido si no se usa 'auto')
-          - auto (bool, opcional): si true, usa primer 'due' de /meds/due
-          - tz_offset_min (int, opcional) minutos vs UTC
-
-        Respuesta:
-          - audio (wav/mp3). ?mode=json devuelve base64 para pruebas.
-        """
         data = request.get_json(silent=True) or {}
         usuario_id = int(data.get("usuario_id") or 0) or None
         auto = bool(data.get("auto"))
@@ -301,7 +222,6 @@ def configurar_rutas(app):
 
         texto = _build_spanish_reminder(nombre, medicamento, dosis, hora)
 
-        # Aquí seguimos respetando TTS_FORMAT (por si quieres MP3 en este endpoint)
         speech = client.audio.speech.create(
             model=TTS_MODEL,
             voice=VOICE,
@@ -321,11 +241,14 @@ def configurar_rutas(app):
                 "audio_base64": base64.b64encode(audio_bytes).decode("utf-8")
             })
 
+        mimetype = "audio/wav" if TTS_FORMAT.lower() == "wav" else "audio/mpeg"
         headers = {
             "X-Usuario-Id": str(usuario_id) if usuario_id else "",
             "X-Medicamento": medicamento,
             "X-Dosis": dosis or "",
             "X-Hora": hora,
         }
-        mimetype = "audio/wav" if TTS_FORMAT.lower() == "wav" else "audio/mpeg"
         return Response(audio_bytes, mimetype=mimetype, headers=headers)
+
+    # <<< REGISTRO DEL BLUEPRINT (fuera de los handlers) >>>
+    app.register_blueprint(api, url_prefix="/")
