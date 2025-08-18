@@ -233,7 +233,7 @@ def configurar_rutas(app):
             "items": items
         })
 
-    # Generar recordatorio TTS (WAV/MP3 configurable por TTS_FORMAT)
+   # Generar recordatorio TTS (WAV/MP3 según disponibilidad del SDK)
     @api.post("/reminder_tts")
     def reminder_tts():
         data = request.get_json(silent=True) or {}
@@ -242,55 +242,56 @@ def configurar_rutas(app):
         tz_offset = data.get("tz_offset_min")
         tz_offset = int(tz_offset) if tz_offset not in (None, "") else None
 
-        if auto:
-            if not usuario_id:
-                return jsonify(error="auto=true requiere usuario_id"), 400
-            now_local = _now_with_offset(tz_offset)
-            due = get_due_meds(usuario_id, now_local, window_min=5)
-            if not due:
-                return jsonify(error="No hay medicamentos para este momento."), 404
-            item = due[0]
-            medicamento = item["medicamento"]
-            dosis = item.get("dosis")
-            hora = item["hora"]
-            nombre = item.get("usuario_nombre")
-        else:
-            medicamento = (data.get("medicamento") or "").strip()
-            dosis = (data.get("dosis") or "").strip() or None
-            hora = (data.get("hora") or "").strip()
-            nombre = None
-            if not medicamento or not hora:
-                return jsonify(error="Faltan campos: 'medicamento' y 'hora'"), 400
+        try:
+            if auto:
+                if not usuario_id:
+                    return jsonify(error="auto=true requiere usuario_id"), 400
+                now_local = _now_with_offset(tz_offset)
+                due = get_due_meds(usuario_id, now_local, window_min=5)
+                if not due:
+                    return jsonify(error="No hay medicamentos para este momento."), 404
+                item = due[0]
+                medicamento = item["medicamento"]
+                dosis = item.get("dosis")
+                hora = item["hora"]
+                nombre = item.get("usuario_nombre")
+            else:
+                medicamento = (data.get("medicamento") or "").strip()
+                dosis = (data.get("dosis") or "").strip() or None
+                hora = (data.get("hora") or "").strip()
+                nombre = None
+                if not medicamento or not hora:
+                    return jsonify(error="Faltan campos: 'medicamento' y 'hora'"), 400
 
-        texto = _build_spanish_reminder(nombre, medicamento, dosis, hora)
+            # Texto del recordatorio
+            texto = _build_spanish_reminder(nombre, medicamento, dosis, hora)
 
-        speech = client.audio.speech.create(
-            model=TTS_MODEL,
-            voice=VOICE,
-            input=texto,
-            format=TTS_FORMAT
-        )
-        audio_bytes = speech.read()
+            # === TTS robusto (WAV si se puede, MP3 si no) ===
+            audio_bytes, mime = synthesize_wav(texto, VOICE)
 
-        if request.args.get("mode") == "json":
-            return jsonify({
-                "usuario_id": usuario_id,
-                "medicamento": medicamento,
-                "dosis": dosis,
-                "hora": hora,
-                "tts_texto": texto,
-                "audio_format": TTS_FORMAT,
-                "audio_base64": base64.b64encode(audio_bytes).decode("utf-8")
-            })
+            # Respuesta en JSON con base64 (debug) si ?mode=json
+            if request.args.get("mode") == "json":
+                return jsonify({
+                    "usuario_id": usuario_id,
+                    "medicamento": medicamento,
+                    "dosis": dosis,
+                    "hora": hora,
+                    "tts_texto": texto,
+                    "audio_mime": mime,
+                    "audio_base64": base64.b64encode(audio_bytes).decode("utf-8")
+                })
 
-        mimetype = "audio/wav" if TTS_FORMAT.lower() == "wav" else "audio/mpeg"
-        headers = {
-            "X-Usuario-Id": str(usuario_id) if usuario_id else "",
-            "X-Medicamento": medicamento,
-            "X-Dosis": dosis or "",
-            "X-Hora": hora,
-        }
-        return Response(audio_bytes, mimetype=mimetype, headers=headers)
+            headers = {
+                "X-Usuario-Id": str(usuario_id) if usuario_id else "",
+                "X-Medicamento": medicamento,
+                "X-Dosis": dosis or "",
+                "X-Hora": hora,
+            }
+            return Response(audio_bytes, mimetype=mime, headers=headers)
+
+        except Exception as e:
+            app.logger.exception("reminder_tts failed")
+            return jsonify(error="reminder_tts_failed", detail=str(e)), 500
 
     # <<< REGISTRO DEL BLUEPRINT (fuera de los handlers) >>>
     app.register_blueprint(api, url_prefix="/")
