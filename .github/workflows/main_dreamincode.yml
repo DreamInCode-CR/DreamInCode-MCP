@@ -94,4 +94,4 @@ jobs:
           app-name: 'DreamInCode'
           slot-name: 'production'
           publish-profile: ${{ secrets.azureWebAppPublishProfile }}
-          package: .
+          package: deploy.zip
