@@ -34,10 +34,13 @@ def configurar_rutas(app):
         now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
         return now_utc if offset_min is None else now_utc + timedelta(minutes=offset_min)
 
-    def _build_spanish_reminder(nombre: str | None, medicamento: str, dosis: str | None, hora: str) -> str:
+    def _build_spanish_reminder(nombre: str | None, medicamento: str, dosis: str | None, hora: str, ask_confirm: bool = True) -> str:
         quien = f"{nombre}, " if nombre else ""
         dosis_txt = f" {dosis}" if dosis else ""
-        return f"Hola {quien}es la hora de tomar {medicamento}{dosis_txt}. Son las {hora}. Por favor tómala con cuidado."
+        base = f"Hola {quien}es la hora de tomar {medicamento}{dosis_txt}. Son las {hora}. Por favor tómala con cuidado."
+        if ask_confirm:
+            base += " ¿Ya te la tomaste? Responde sí o no."
+        return base
 
     def transcribir_audio(file_storage) -> str:
         """STT: archivo (werkzeug FileStorage) -> texto."""
@@ -98,6 +101,78 @@ def configurar_rutas(app):
             input=texto,
         )
         return r.read(), "audio/mpeg"
+    
+    def _classify_confirm_heuristic(text: str) -> str:
+        """
+        Devuelve 'yes' | 'no' | 'unsure' con heurística simple en español.
+        """
+        t = (text or "").strip().lower()
+        if not t:
+            return "unsure"
+
+        # afirmaciones típicas
+        yes_words = [
+            "sí", "si", "ya", "claro", "por supuesto", "listo", "hecho",
+            "me la tomé", "me la tome", "ya la tomé", "ya la tome",
+            "ya lo hice", "la tomé", "la tome"
+            ]
+        for w in yes_words:
+            if w in t:
+                return "yes"
+
+        # negaciones típicas
+        no_words = [
+            "no", "todavía no", "aún no", "aun no", "después", "luego",
+            "más tarde", "mas tarde", "no la tomé", "no la tome",
+            "no lo hice"
+        ]
+        for w in no_words:
+            if w in t:
+                return "no"
+
+        return "unsure"
+
+
+    def _classify_confirm_llm(text: str) -> tuple[str, float]:
+        """
+        Pide al LLM un dict {"intent":"yes|no|unsure","confidence":0-1}.
+        Si falla el parseo, cae a ('unsure', 0.33).
+        """
+        try:
+            system = (
+                "Eres un clasificador muy estricto. "
+                "Tienes que decidir si la respuesta indica que el usuario YA se tomó el medicamento (yes), "
+                "NO se lo ha tomado (no), o no es claro (unsure). "
+                "Responde SOLO un JSON como {\"intent\":\"yes|no|unsure\",\"confidence\":0.0-1.0}."
+            )
+            resp = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": f"Respuesta del usuario: {text}"}
+                ],
+                temperature=0.0,
+            )
+            content = resp.choices[0].message.content.strip()
+            import json
+            data = json.loads(content)
+            intent = data.get("intent", "unsure")
+            conf = float(data.get("confidence", 0.5))
+            if intent not in ("yes", "no", "unsure"):
+                intent = "unsure"
+            return intent, conf
+        except Exception:
+            return "unsure", 0.33
+
+
+    def classify_confirmation(text: str) -> tuple[str, float]:
+        """
+        Usa heurística rápida y, si queda 'unsure', pide ayuda al LLM.
+        """
+        first = _classify_confirm_heuristic(text)
+        if first != "unsure":
+            return first, 0.9 if first in ("yes", "no") else 0.5
+        return _classify_confirm_llm(text)
 
 
     # -------------------- Rutas --------------------
@@ -310,6 +385,77 @@ def configurar_rutas(app):
         except Exception as e:
             app.logger.exception("reminder_tts failed")
             return jsonify(error="reminder_tts_failed", detail=str(e)), 500
+        
+
+    @api.post("/confirm_intake")
+    def confirm_intake():
+        """
+        Confirma si el usuario tomó la pastilla.
+        Acepta:
+        - form-data con 'audio' (voz); o
+        - JSON con 'texto'.
+        Campos útiles: usuario_id, medicamento, hora, return=json|audio
+        Devuelve WAV/MP3 (preferencia WAV) o JSON si return=json.
+        """
+        data = request.get_json(silent=True) or {}
+
+        # Soporta form-data o JSON
+        usuario_id = request.form.get("usuario_id") or data.get("usuario_id")
+        medicamento = request.form.get("medicamento") or data.get("medicamento") or ""
+        hora = request.form.get("hora") or data.get("hora") or ""
+        want = (request.form.get("return") or data.get("return") or "audio").lower()
+
+        if "audio" in request.files:
+            try:
+                texto = transcribir_audio(request.files["audio"])
+            except Exception as e:
+                app.logger.exception("STT error en confirm_intake")
+                return jsonify(error="stt_failed", detail=str(e)), 500
+        else:
+            texto = (data.get("texto") or "").strip()
+
+        # clasificar
+        intent, conf = classify_confirmation(texto)
+
+        # stub: registra en BD si existe función
+        status = {"yes": "taken", "no": "missed", "unsure": "unclear"}[intent]
+        try:
+            from mcp.database import log_med_intake
+            log_med_intake(int(usuario_id) if usuario_id else None, medicamento, hora, status)
+        except Exception:
+            pass  # si no existe, seguimos
+
+        # Mensaje de voz a devolver
+        if intent == "yes":
+            speak = f"Perfecto. He registrado que tomaste {medicamento}. ¡Bien hecho!"
+        elif intent == "no":
+            speak = f"De acuerdo. Te recordaré más tarde. Por favor, no lo olvides."
+        else:
+            speak = "No te escuché bien. ¿La tomaste? Responde sí o no."
+
+        if want == "json":
+            return jsonify({
+                "transcript": texto,
+                "intent": intent,
+                "confidence": conf,
+                "status": status,
+                "speak": speak
+            })
+
+        # Audio preferentemente WAV
+        try:
+            audio_bytes, mime = synthesize_wav(speak, VOICE)
+        except Exception as e:
+            app.logger.exception("TTS error en confirm_intake")
+            return jsonify(error="tts_failed", detail=str(e)), 500
+
+        ext = "wav" if mime == "audio/wav" else "mp3"
+        return send_file(
+            io.BytesIO(audio_bytes),
+            mimetype=mime,
+            as_attachment=False,
+            download_name=f"confirm.{ext}",
+        )
 
 
     # <<< REGISTRO DEL BLUEPRINT (fuera de los handlers) >>>
