@@ -458,5 +458,29 @@ def configurar_rutas(app):
         )
 
 
+    # --- Todos los medicamentos de un usuario ---
+    @api.get("/meds/all")
+    def meds_all():
+        """Devuelve todas las filas de dbo.Medicamentos para el usuario dado."""
+        try:
+            usuario_id = int(request.args.get("usuario_id") or os.getenv("DEFAULT_USUARIO_ID", 3))
+        except (TypeError, ValueError):
+            return jsonify(error="usuario_id inválido"), 400
+
+        try:
+            from mcp.database import get_all_meds  # asegúrate de tener la función abajo
+            items = get_all_meds(usuario_id)
+            return jsonify({
+                "usuario_id": usuario_id,
+                "count": len(items),
+                "items": items
+            })
+        except Exception as e:
+            app.logger.exception("error en /meds/all")
+            return jsonify(error="db_failure", detail=str(e)), 500
+
+
+
+
     # <<< REGISTRO DEL BLUEPRINT (fuera de los handlers) >>>
     app.register_blueprint(api, url_prefix="/")

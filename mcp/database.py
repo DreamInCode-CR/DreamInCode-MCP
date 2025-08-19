@@ -1,7 +1,12 @@
 # mcp/database.py
 import pyodbc
 from datetime import datetime, time
+import datetime  # módulo, usado para date/datetime en normalizaciones
 
+
+# -------------------------------------------------------------------
+# Conexión
+# -------------------------------------------------------------------
 def get_connection():
     conn = pyodbc.connect(
         "DRIVER={ODBC Driver 17 for SQL Server};"
@@ -16,6 +21,9 @@ def get_connection():
     return conn
 
 
+# -------------------------------------------------------------------
+# Usuario / Enfermedades
+# -------------------------------------------------------------------
 def obtener_enfermedades_usuario(usuario_id: int):
     """Devuelve lista de nombres de enfermedades del usuario."""
     with get_connection() as conn:
@@ -142,4 +150,67 @@ def get_due_meds(usuario_id: int, now_local: datetime, window_min: int = 5):
                 "hora": r.Hora.strftime("%H:%M"),
             })
 
+    # <-- ¡Faltaba este return dentro de la función!
     return items
+
+
+# -------------------------------------------------------------------
+# Listado completo de medicamentos por usuario (tabla dbo.Medicamentos)
+# -------------------------------------------------------------------
+def get_all_meds(usuario_id: int) -> list[dict]:
+    """
+    Lee todas las columnas de dbo.Medicamentos para el UsuarioID dado.
+    Normaliza tipos para JSON (bool, fechas ISO, hora HH:mm).
+    """
+    sql = """
+    SELECT
+        MedicamentoID,
+        UsuarioID,
+        NombreMedicamento,
+        Dosis,
+        Instrucciones,
+        FechaInicio,
+        FechaHasta,
+        Lunes, Martes, Miercoles, Jueves, Viernes, Sabado, Domingo,
+        Activo,
+        CreatedAt,
+        HoraToma
+    FROM dbo.Medicamentos
+    WHERE UsuarioID = ?
+    ORDER BY Activo DESC, NombreMedicamento ASC, HoraToma ASC
+    """
+
+    rows_out: list[dict] = []
+
+    with get_connection() as cn:  # <- corregido (antes decía get_conn)
+        cur = cn.cursor()
+        rs = cur.execute(sql, (usuario_id,))
+        cols = [c[0] for c in cur.description]
+
+        for row in rs.fetchall():
+            rec = dict(zip(cols, row))
+
+            # bits -> bool
+            for f in ("Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo", "Activo"):
+                if f in rec and rec[f] is not None:
+                    rec[f] = bool(rec[f])
+
+            # fechas -> ISO
+            if rec.get("FechaInicio") and isinstance(rec["FechaInicio"], (datetime.date, datetime.datetime)):
+                rec["FechaInicio"] = rec["FechaInicio"].isoformat()
+            if rec.get("FechaHasta") and isinstance(rec["FechaHasta"], (datetime.date, datetime.datetime)):
+                rec["FechaHasta"] = rec["FechaHasta"].isoformat()
+            if rec.get("CreatedAt") and isinstance(rec["CreatedAt"], (datetime.date, datetime.datetime)):
+                rec["CreatedAt"] = rec["CreatedAt"].isoformat()
+
+            # hora -> HH:mm
+            if rec.get("HoraToma"):
+                ht = rec["HoraToma"]
+                if isinstance(ht, datetime.time):
+                    rec["HoraToma"] = ht.strftime("%H:%M")
+                else:
+                    rec["HoraToma"] = str(ht)
+
+            rows_out.append(rec)
+
+    return rows_out
