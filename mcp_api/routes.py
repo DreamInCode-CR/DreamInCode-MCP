@@ -1,4 +1,4 @@
-# mcp_api/routes.py  (versión unificada)
+# mcp_api/routes.py
 import os
 import io
 import base64
@@ -10,18 +10,17 @@ from openai import OpenAI
 
 # Tu lógica propia
 from mcp.database import get_due_meds
-from mcp.core import procesar_mensaje           # Mantén tu implementación
-from mcp.context import build_system_prompt     # Mantén tu system prompt
+from mcp.core import procesar_mensaje
+from mcp.context import build_system_prompt
 
 def configurar_rutas(app):
     api = Blueprint("api", __name__)
 
-    # -------- Config desde variables de entorno (Azure App Settings) --------
+    # -------- Config desde variables de entorno --------
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     CHAT_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     STT_MODEL      = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
     TTS_MODEL      = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-    TTS_FORMAT     = os.getenv("OPENAI_TTS_FORMAT", "wav")
     VOICE          = os.getenv("OPENAI_VOICE", "alloy")
 
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -43,7 +42,6 @@ def configurar_rutas(app):
         return base
 
     def transcribir_audio(file_storage) -> str:
-        """STT: archivo (werkzeug FileStorage) -> texto."""
         data = file_storage.read()
         filename = file_storage.filename or "audio.wav"
         mimetype = file_storage.mimetype or "audio/wav"
@@ -55,19 +53,18 @@ def configurar_rutas(app):
 
     def synthesize_wav(texto: str, voice: str | None = None):
         """
-        Genera audio para `texto`. Intenta WAV primero usando audio.speech con `extra_body`.
-        Si no está soportado, hace fallback a MP3 (audio/mpeg).
+        Intenta WAV (via extra_body) y cae a MP3 si no es posible.
         Devuelve: (audio_bytes, mime)
         """
         v = voice or VOICE
 
-        # 1) Streaming + WAV via extra_body (evita 'format' como kwarg)
+        # 1) Streaming + WAV via extra_body
         try:
             with client.audio.speech.with_streaming_response.create(
                 model=TTS_MODEL,
                 voice=v,
                 input=texto,
-                extra_body={"format": "wav"},   # <- clave: pedir WAV aquí
+                extra_body={"format": "wav"},
             ) as r:
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 try:
@@ -75,14 +72,12 @@ def configurar_rutas(app):
                     with open(tmp.name, "rb") as f:
                         return f.read(), "audio/wav"
                 finally:
-                    try:
-                        os.remove(tmp.name)
-                    except Exception:
-                        pass
+                    try: os.remove(tmp.name)
+                    except Exception: pass
         except Exception:
-            pass  # probamos siguiente intento
+            pass
 
-        # 2) No-streaming + WAV via extra_body
+        # 2) No streaming + WAV via extra_body
         try:
             r = client.audio.speech.create(
                 model=TTS_MODEL,
@@ -94,56 +89,32 @@ def configurar_rutas(app):
         except Exception:
             pass
 
-        # 3) Último recurso: sin formato (normalmente MP3)
+        # 3) Fallback MP3
         r = client.audio.speech.create(
             model=TTS_MODEL,
             voice=v,
             input=texto,
         )
         return r.read(), "audio/mpeg"
-    
+
+    # --- Clasificación confirmación ---
     def _classify_confirm_heuristic(text: str) -> str:
-        """
-        Devuelve 'yes' | 'no' | 'unsure' con heurística simple en español.
-        """
         t = (text or "").strip().lower()
         if not t:
             return "unsure"
-
-        # afirmaciones típicas
-        yes_words = [
-            "sí", "si", "ya", "claro", "por supuesto", "listo", "hecho",
-            "me la tomé", "me la tome", "ya la tomé", "ya la tome",
-            "ya lo hice", "la tomé", "la tome"
-            ]
-        for w in yes_words:
-            if w in t:
-                return "yes"
-
-        # negaciones típicas
-        no_words = [
-            "no", "todavía no", "aún no", "aun no", "después", "luego",
-            "más tarde", "mas tarde", "no la tomé", "no la tome",
-            "no lo hice"
-        ]
-        for w in no_words:
-            if w in t:
-                return "no"
-
+        yes_words = ["sí","si","ya","claro","por supuesto","listo","hecho","me la tomé","me la tome","ya la tomé","ya la tome","ya lo hice","la tomé","la tome"]
+        no_words  = ["no","todavía no","aún no","aun no","después","luego","más tarde","mas tarde","no la tomé","no la tome","no lo hice"]
+        if any(w in t for w in yes_words): return "yes"
+        if any(w in t for w in no_words):  return "no"
         return "unsure"
 
-
     def _classify_confirm_llm(text: str) -> tuple[str, float]:
-        """
-        Pide al LLM un dict {"intent":"yes|no|unsure","confidence":0-1}.
-        Si falla el parseo, cae a ('unsure', 0.33).
-        """
         try:
             system = (
                 "Eres un clasificador muy estricto. "
-                "Tienes que decidir si la respuesta indica que el usuario YA se tomó el medicamento (yes), "
+                "Decide si la respuesta indica que el usuario YA se tomó el medicamento (yes), "
                 "NO se lo ha tomado (no), o no es claro (unsure). "
-                "Responde SOLO un JSON como {\"intent\":\"yes|no|unsure\",\"confidence\":0.0-1.0}."
+                'Responde SOLO un JSON como {"intent":"yes|no|unsure","confidence":0-1}.'
             )
             resp = client.chat.completions.create(
                 model=CHAT_MODEL,
@@ -153,8 +124,8 @@ def configurar_rutas(app):
                 ],
                 temperature=0.0,
             )
-            content = resp.choices[0].message.content.strip()
             import json
+            content = resp.choices[0].message.content.strip()
             data = json.loads(content)
             intent = data.get("intent", "unsure")
             conf = float(data.get("confidence", 0.5))
@@ -164,16 +135,11 @@ def configurar_rutas(app):
         except Exception:
             return "unsure", 0.33
 
-
     def classify_confirmation(text: str) -> tuple[str, float]:
-        """
-        Usa heurística rápida y, si queda 'unsure', pide ayuda al LLM.
-        """
         first = _classify_confirm_heuristic(text)
         if first != "unsure":
             return first, 0.9 if first in ("yes", "no") else 0.5
         return _classify_confirm_llm(text)
-
 
     # -------------------- Rutas --------------------
     @api.get("/")
@@ -184,57 +150,39 @@ def configurar_rutas(app):
     def health():
         return jsonify({"status": "ok", "service": "api"})
 
-    # Texto -> respuesta (usa tu procesar_mensaje)
     @api.post("/mcp")
     def mcp():
         data = request.get_json(silent=True) or {}
         mensaje_usuario = (data.get("mensaje") or "").strip()
         usuario_id = _get_usuario_id(data)
         system = build_system_prompt(usuario_id)
-        # Tu procesar_mensaje debe soportar system_override si quieres inyectarlo:
         respuesta = procesar_mensaje(mensaje_usuario, usuario_id, system_override=system)
         return jsonify({"respuesta": respuesta})
 
-    # Solo STT
     @api.post("/stt")
     def stt():
         if "audio" not in request.files:
             return jsonify(error="Sube el archivo en form-data con la clave 'audio'"), 400
-
         _ = int(request.form.get("usuario_id") or request.form.get("UsuarioID") or 3)
-        lang = request.form.get("lang")  # opcional
-
+        lang = request.form.get("lang")
         f = request.files["audio"]
-        suffix = os.path.splitext(f.filename or "")[1] or ".wav"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            f.save(tmp.name)
-            tmp_path = tmp.name
+        filename = f.filename or "audio.wav"
+        mimetype = f.mimetype or "audio/wav"
+        tr = client.audio.transcriptions.create(
+            model=STT_MODEL,
+            file=(filename, f.read(), mimetype),
+            language=lang
+        )
+        return jsonify({"transcripcion": tr.text})
 
-        try:
-            with open(tmp_path, "rb") as audio_file:
-                tr = client.audio.transcriptions.create(
-                    model=STT_MODEL,
-                    file=audio_file,
-                    language=lang
-                )
-            return jsonify({"transcripcion": tr.text})
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-    # Flujo completo: voz -> texto -> MCP -> TTS
     @api.post("/voice_mcp")
     def voice_mcp():
         if "audio" not in request.files:
             return jsonify(error="faltó 'audio' en form-data"), 400
-
         audio_file = request.files["audio"]
         usuario_id = request.form.get("usuario_id")
         retorno = (request.form.get("return") or "audio").strip().lower()
 
-        # STT + LLM
         try:
             texto = transcribir_audio(audio_file)
             system = build_system_prompt(usuario_id)
@@ -243,11 +191,9 @@ def configurar_rutas(app):
             app.logger.exception("Error en STT o LLM")
             return jsonify(error="processing_failed", detail=str(e)), 500
 
-        # Solo JSON (sin TTS) si lo piden
         if retorno == "json":
             return jsonify({"transcript": texto, "reply": respuesta_texto})
 
-        # TTS -> audio (WAV preferido; MP3 si no hay otra)
         try:
             audio_bytes, mime = synthesize_wav(respuesta_texto)
         except Exception as e:
@@ -262,31 +208,25 @@ def configurar_rutas(app):
             download_name=f"reply.{ext}",
         )
 
-
-
-    # Texto -> TTS directo
     @api.post("/tts")
     def tts():
-            data = request.get_json(silent=True) or {}
-            texto = (data.get("texto") or "").strip()
-            if not texto:
-                return jsonify(error="Falta 'texto'"), 400
+        data = request.get_json(silent=True) or {}
+        texto = (data.get("texto") or "").strip()
+        if not texto:
+            return jsonify(error="Falta 'texto'"), 400
+        voice = data.get("voice") or VOICE
+        try:
+            audio_bytes, mime = synthesize_wav(texto, voice)
+        except Exception as e:
+            app.logger.exception("Error en TTS")
+            return jsonify(error="tts_failed", detail=str(e)), 500
+        ext = "wav" if mime == "audio/wav" else "mp3"
+        return Response(
+            audio_bytes,
+            mimetype=mime,
+            headers={"Content-Disposition": f'inline; filename="tts.{ext}"'}
+        )
 
-            voice = data.get("voice") or VOICE
-
-            try:
-                audio_bytes, mime = synthesize_wav(texto, voice)
-            except Exception as e:
-                app.logger.exception("Error en TTS")
-                return jsonify(error="tts_failed", detail=str(e)), 500
-
-            ext = "wav" if mime == "audio/wav" else "mp3"
-            return Response(
-                audio_bytes,
-                mimetype=mime,
-                headers={"Content-Disposition": f'inline; filename="tts.{ext}"'}
-            )
-    # Qué medicamento toca ahora (JSON)
     @api.get("/meds/due")
     def meds_due():
         try:
@@ -308,7 +248,6 @@ def configurar_rutas(app):
             "items": items
         })
 
-  # Generar recordatorio TTS (WAV/MP3 según disponibilidad del SDK)
     @api.post("/reminder_tts")
     def reminder_tts():
         data = request.get_json(silent=True) or {}
@@ -338,22 +277,9 @@ def configurar_rutas(app):
                 if not medicamento or not hora:
                     return jsonify(error="Faltan campos: 'medicamento' y 'hora'"), 400
 
-            # Texto del recordatorio
             texto = _build_spanish_reminder(nombre, medicamento, dosis, hora)
-
-            # Genera audio con preferencia **WAV**
             audio_bytes, mime = synthesize_wav(texto, VOICE)
 
-            # (opcional) segundo intento por si el SDK no entregó WAV a la primera
-            if mime != "audio/wav":
-                try:
-                    audio_bytes2, mime2 = synthesize_wav(texto, VOICE)
-                    if mime2 == "audio/wav":
-                        audio_bytes, mime = audio_bytes2, mime2
-                except Exception:
-                    pass
-
-            # ¿Modo JSON para depurar?
             if request.args.get("mode") == "json":
                 return jsonify({
                     "usuario_id": usuario_id,
@@ -365,41 +291,25 @@ def configurar_rutas(app):
                     "audio_base64": base64.b64encode(audio_bytes).decode("utf-8"),
                 })
 
-          # Enviar como archivo, igual que /voice_mcp, con nombre estable
             ext = "wav" if mime == "audio/wav" else "mp3"
-
             resp = send_file(
                 io.BytesIO(audio_bytes),
                 mimetype=(mime or "audio/wav"),
-                as_attachment=True,                         # << fuerza descarga con nombre
-                download_name=f"reminder.{ext}",            # << pone extensión correcta
+                as_attachment=True,
+                download_name=f"reminder.{ext}",
             )
-
-            # (opcional) conservar tus cabeceras X-*
             resp.headers["X-Usuario-Id"] = str(usuario_id) if usuario_id else ""
             resp.headers["X-Medicamento"] = medicamento
             resp.headers["X-Dosis"] = dosis or ""
             resp.headers["X-Hora"] = hora
-
             return resp
         except Exception as e:
             app.logger.exception("reminder_tts failed")
             return jsonify(error="reminder_tts_failed", detail=str(e)), 500
-        
 
     @api.post("/confirm_intake")
     def confirm_intake():
-        """
-        Confirma si el usuario tomó la pastilla.
-        Acepta:
-        - form-data con 'audio' (voz); o
-        - JSON con 'texto'.
-        Campos útiles: usuario_id, medicamento, hora, return=json|audio
-        Devuelve WAV/MP3 (preferencia WAV) o JSON si return=json.
-        """
         data = request.get_json(silent=True) or {}
-
-        # Soporta form-data o JSON
         usuario_id = request.form.get("usuario_id") or data.get("usuario_id")
         medicamento = request.form.get("medicamento") or data.get("medicamento") or ""
         hora = request.form.get("hora") or data.get("hora") or ""
@@ -414,26 +324,17 @@ def configurar_rutas(app):
         else:
             texto = (data.get("texto") or "").strip()
 
-        # clasificar
         intent, conf = classify_confirmation(texto)
-
-        # stub: registra en BD si existe función
         status = {"yes": "taken", "no": "missed", "unsure": "unclear"}[intent]
-        try:
-            from mcp.database import log_med_intake
-            log_med_intake(int(usuario_id) if usuario_id else None, medicamento, hora, status)
-        except Exception:
-            pass  # si no existe, seguimos
-
-        # Mensaje de voz a devolver
-        if intent == "yes":
-            speak = f"Perfecto. He registrado que tomaste {medicamento}. ¡Bien hecho!"
-        elif intent == "no":
-            speak = f"De acuerdo. Te recordaré más tarde. Por favor, no lo olvides."
-        else:
-            speak = "No te escuché bien. ¿La tomaste? Responde sí o no."
 
         if want == "json":
+            speak = (
+                "Perfecto. He registrado que tomaste tu medicamento. ¡Bien hecho!"
+                if intent == "yes" else
+                "De acuerdo. Te recordaré más tarde. Por favor, no lo olvides."
+                if intent == "no" else
+                "No te escuché bien. ¿La tomaste? Responde sí o no."
+            )
             return jsonify({
                 "transcript": texto,
                 "intent": intent,
@@ -442,8 +343,14 @@ def configurar_rutas(app):
                 "speak": speak
             })
 
-        # Audio preferentemente WAV
         try:
+            speak = (
+                "Perfecto. He registrado que tomaste tu medicamento. ¡Bien hecho!"
+                if intent == "yes" else
+                "De acuerdo. Te recordaré más tarde. Por favor, no lo olvides."
+                if intent == "no" else
+                "No te escuché bien. ¿La tomaste? Responde sí o no."
+            )
             audio_bytes, mime = synthesize_wav(speak, VOICE)
         except Exception as e:
             app.logger.exception("TTS error en confirm_intake")
@@ -457,18 +364,15 @@ def configurar_rutas(app):
             download_name=f"confirm.{ext}",
         )
 
-
-    # --- Todos los medicamentos de un usuario ---
     @api.get("/meds/all")
     def meds_all():
-        """Devuelve todas las filas de dbo.Medicamentos para el usuario dado."""
         try:
             usuario_id = int(request.args.get("usuario_id") or os.getenv("DEFAULT_USUARIO_ID", 3))
         except (TypeError, ValueError):
             return jsonify(error="usuario_id inválido"), 400
 
         try:
-            from mcp.database import get_all_meds  # asegúrate de tener la función abajo
+            from mcp.database import get_all_meds
             items = get_all_meds(usuario_id)
             return jsonify({
                 "usuario_id": usuario_id,
@@ -479,120 +383,4 @@ def configurar_rutas(app):
             app.logger.exception("error en /meds/all")
             return jsonify(error="db_failure", detail=str(e)), 500
 
-# === NUEVO: APPOINTMENTS (CITAS) ===
-
-    @api.get("/appts/all")
-    def appts_all():
-        try:
-            usuario_id = int(request.args.get("usuario_id") or os.getenv("DEFAULT_USUARIO_ID", 3))
-        except (TypeError, ValueError):
-            return jsonify(error="usuario_id inválido"), 400
-
-        try:
-            from mcp.database import get_all_appointments
-            items = get_all_appointments(usuario_id)
-            return jsonify({"usuario_id": usuario_id, "count": len(items), "items": items})
-        except Exception as e:
-            app.logger.exception("error en /appts/all")
-            return jsonify(error="db_failure", detail=str(e)), 500
-
-
-    @api.get("/appts/due")
-    def appts_due():
-        try:
-            usuario_id = int(request.args.get("usuario_id"))
-        except (TypeError, ValueError):
-            return jsonify(error="usuario_id requerido"), 400
-
-        window = int(request.args.get("window_min", 5))
-        tz_offset = request.args.get("tz_offset_min")
-        tz_offset = int(tz_offset) if tz_offset not in (None, "") else None
-
-        now_local = _now_with_offset(tz_offset)
-
-        try:
-            from mcp.database import get_due_appointments
-            items = get_due_appointments(usuario_id, now_local, window)
-        except Exception as e:
-            app.logger.exception("error en /appts/due")
-            return jsonify(error="db_failure", detail=str(e)), 500
-
-        return jsonify({
-            "usuario_id": usuario_id,
-            "now_local": now_local.isoformat(),
-            "window_min": window,
-            "items": items
-        })
-
-
-    def _build_appointment_prompt(nombre, titulo, hora, lugar=None, doctor=None, ask_confirm=True):
-        quien = f"{nombre}, " if nombre else ""
-        lugar_txt = f" en {lugar}" if lugar else ""
-        doctor_txt = f" con {doctor}" if doctor else ""
-        base = f"Hola {quien}tienes una cita de {titulo}{lugar_txt}{doctor_txt} a las {hora}."
-        if ask_confirm:
-            base += " ¿Vas a asistir? Responde sí o no."
-        return base
-
-
-    @api.post("/appointment_tts")
-    def appointment_tts():
-        """
-        JSON:
-        auto: true -> busca una cita 'due' ahora (usa tz_offset_min y usuario_id)
-        auto: false -> requiere titulo y hora (y opcional lugar/doctor)
-        """
-        data = request.get_json(silent=True) or {}
-        usuario_id = int(data.get("usuario_id") or 0) or None
-        auto = bool(data.get("auto"))
-        tz_offset = data.get("tz_offset_min")
-        tz_offset = int(tz_offset) if tz_offset not in (None, "") else None
-
-        try:
-            if auto:
-                if not usuario_id:
-                    return jsonify(error="auto=true requiere usuario_id"), 400
-                now_local = _now_with_offset(tz_offset)
-                from mcp.database import get_due_appointments
-                due = get_due_appointments(usuario_id, now_local, window_min=5)
-                if not due:
-                    return jsonify(error="No hay citas para este momento."), 404
-                item = due[0]
-                titulo = item["titulo"]
-                hora   = item["hora"]
-                lugar  = item.get("lugar")
-                doctor = item.get("doctor")
-                nombre = item.get("usuario_nombre")
-            else:
-                titulo = (data.get("titulo") or "").strip()
-                hora   = (data.get("hora") or "").strip()
-                lugar  = (data.get("lugar") or "").strip() or None
-                doctor = (data.get("doctor") or "").strip() or None
-                nombre = None
-                if not titulo or not hora:
-                    return jsonify(error="Faltan campos: 'titulo' y 'hora'"), 400
-
-            texto = _build_appointment_prompt(nombre, titulo, hora, lugar, doctor, ask_confirm=True)
-            audio_bytes, mime = synthesize_wav(texto, VOICE)
-            if mime != "audio/wav":
-                try:
-                    audio_bytes2, mime2 = synthesize_wav(texto, VOICE)
-                    if mime2 == "audio/wav":
-                        audio_bytes, mime = audio_bytes2, mime2
-                except Exception:
-                    pass
-
-            ext = "wav" if mime == "audio/wav" else "mp3"
-            return send_file(
-                io.BytesIO(audio_bytes),
-                mimetype=mime,
-                as_attachment=False,
-                download_name=f"appointment.{ext}",
-            )
-        except Exception as e:
-            app.logger.exception("appointment_tts failed")
-            return jsonify(error="appointment_tts_failed", detail=str(e)), 500
-
-
-    # <<< REGISTRO DEL BLUEPRINT (fuera de los handlers) >>>
     app.register_blueprint(api, url_prefix="/")
