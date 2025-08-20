@@ -479,7 +479,119 @@ def configurar_rutas(app):
             app.logger.exception("error en /meds/all")
             return jsonify(error="db_failure", detail=str(e)), 500
 
+# === NUEVO: APPOINTMENTS (CITAS) ===
 
+    @api.get("/appts/all")
+    def appts_all():
+        try:
+            usuario_id = int(request.args.get("usuario_id") or os.getenv("DEFAULT_USUARIO_ID", 3))
+        except (TypeError, ValueError):
+            return jsonify(error="usuario_id inválido"), 400
+
+        try:
+            from mcp.database import get_all_appointments
+            items = get_all_appointments(usuario_id)
+            return jsonify({"usuario_id": usuario_id, "count": len(items), "items": items})
+        except Exception as e:
+            app.logger.exception("error en /appts/all")
+            return jsonify(error="db_failure", detail=str(e)), 500
+
+
+    @api.get("/appts/due")
+    def appts_due():
+        try:
+            usuario_id = int(request.args.get("usuario_id"))
+        except (TypeError, ValueError):
+            return jsonify(error="usuario_id requerido"), 400
+
+        window = int(request.args.get("window_min", 5))
+        tz_offset = request.args.get("tz_offset_min")
+        tz_offset = int(tz_offset) if tz_offset not in (None, "") else None
+
+        now_local = _now_with_offset(tz_offset)
+
+        try:
+            from mcp.database import get_due_appointments
+            items = get_due_appointments(usuario_id, now_local, window)
+        except Exception as e:
+            app.logger.exception("error en /appts/due")
+            return jsonify(error="db_failure", detail=str(e)), 500
+
+        return jsonify({
+            "usuario_id": usuario_id,
+            "now_local": now_local.isoformat(),
+            "window_min": window,
+            "items": items
+        })
+
+
+    def _build_appointment_prompt(nombre, titulo, hora, lugar=None, doctor=None, ask_confirm=True):
+        quien = f"{nombre}, " if nombre else ""
+        lugar_txt = f" en {lugar}" if lugar else ""
+        doctor_txt = f" con {doctor}" if doctor else ""
+        base = f"Hola {quien}tienes una cita de {titulo}{lugar_txt}{doctor_txt} a las {hora}."
+        if ask_confirm:
+            base += " ¿Vas a asistir? Responde sí o no."
+        return base
+
+
+    @api.post("/appointment_tts")
+    def appointment_tts():
+        """
+        JSON:
+        auto: true -> busca una cita 'due' ahora (usa tz_offset_min y usuario_id)
+        auto: false -> requiere titulo y hora (y opcional lugar/doctor)
+        """
+        data = request.get_json(silent=True) or {}
+        usuario_id = int(data.get("usuario_id") or 0) or None
+        auto = bool(data.get("auto"))
+        tz_offset = data.get("tz_offset_min")
+        tz_offset = int(tz_offset) if tz_offset not in (None, "") else None
+
+        try:
+            if auto:
+                if not usuario_id:
+                    return jsonify(error="auto=true requiere usuario_id"), 400
+                now_local = _now_with_offset(tz_offset)
+                from mcp.database import get_due_appointments
+                due = get_due_appointments(usuario_id, now_local, window_min=5)
+                if not due:
+                    return jsonify(error="No hay citas para este momento."), 404
+                item = due[0]
+                titulo = item["titulo"]
+                hora   = item["hora"]
+                lugar  = item.get("lugar")
+                doctor = item.get("doctor")
+                nombre = item.get("usuario_nombre")
+            else:
+                titulo = (data.get("titulo") or "").strip()
+                hora   = (data.get("hora") or "").strip()
+                lugar  = (data.get("lugar") or "").strip() or None
+                doctor = (data.get("doctor") or "").strip() or None
+                nombre = None
+                if not titulo or not hora:
+                    return jsonify(error="Faltan campos: 'titulo' y 'hora'"), 400
+
+            texto = _build_appointment_prompt(nombre, titulo, hora, lugar, doctor, ask_confirm=True)
+            audio_bytes, mime = synthesize_wav(texto, VOICE)
+            if mime != "audio/wav":
+                try:
+                    audio_bytes2, mime2 = synthesize_wav(texto, VOICE)
+                    if mime2 == "audio/wav":
+                        audio_bytes, mime = audio_bytes2, mime2
+                except Exception:
+                    pass
+
+            ext = "wav" if mime == "audio/wav" else "mp3"
+            return send_file(
+                io.BytesIO(audio_bytes),
+                mimetype=mime,
+                as_attachment=False,
+                download_name=f"appointment.{ext}",
+            )
+        except Exception as e:
+            app.logger.exception("appointment_tts failed")
+            return jsonify(error="appointment_tts_failed", detail=str(e)), 500
 
 
     # <<< REGISTRO DEL BLUEPRINT (fuera de los handlers) >>>
