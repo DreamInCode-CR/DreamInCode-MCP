@@ -3,7 +3,6 @@ import pyodbc
 from datetime import datetime, time
 import datetime  # módulo, usado para date/datetime en normalizaciones
 
-
 # -------------------------------------------------------------------
 # Conexión
 # -------------------------------------------------------------------
@@ -19,7 +18,6 @@ def get_connection():
         "Connection Timeout=30;"
     )
     return conn
-
 
 # -------------------------------------------------------------------
 # Usuario / Enfermedades
@@ -38,7 +36,6 @@ def obtener_enfermedades_usuario(usuario_id: int):
             (usuario_id,),
         )
         return [row.Nombre for row in cur.fetchall()]
-
 
 def obtener_datos_usuario(usuario_id: int):
     """
@@ -68,28 +65,29 @@ def obtener_datos_usuario(usuario_id: int):
         "enfermedades": enfermedades,
     }
 
-
 # -------------------------------------------------------------------
 # Helpers y consulta para “qué medicamento toca ahora”
-#   (Esquema con UsuarioMedicacion + UsuarioMedicacionHorario)
+#   Ahora se usa SOLO dbo.Medicamentos (bits de día + HoraToma)
 # -------------------------------------------------------------------
-def _weekday_flag_column(dt: datetime) -> str:
-    """Lunes=0 ... Domingo=6 -> nombre de columna bit en la tabla horario."""
-    return ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"][dt.weekday()]
-
+def _weekday_flag_column(dt_obj: datetime) -> str:
+    """Lunes=0 ... Domingo=6 -> nombre de columna bit en la tabla Medicamentos."""
+    return ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"][dt_obj.weekday()]
 
 def _time_to_minutes(t: time) -> int:
     return t.hour * 60 + t.minute
 
-
 def get_due_meds(usuario_id: int, now_local: datetime, window_min: int = 5):
     """
     Devuelve una lista de medicamentos que 'tocan' ahora (± window_min minutos)
-    para el usuario dado, considerando día de semana y hora local.
+    para el usuario dado, leyendo de dbo.Medicamentos y respetando:
+      - Activo
+      - FechaInicio / FechaHasta (si vienen)
+      - bits Lunes..Domingo
+      - HoraToma
 
     Estructura del item:
       {
-        "usuario_nombre": str | None,
+        "usuario_nombre": None,
         "medicamento": str,
         "dosis": str | None,
         "instrucciones": str | None,
@@ -100,53 +98,68 @@ def get_due_meds(usuario_id: int, now_local: datetime, window_min: int = 5):
     now_min = now_local.hour * 60 + now_local.minute
     items = []
 
-    sql = f"""
-    SELECT u.Nombre AS UsuarioNombre,
-           m.Nombre AS Medicamento,
-           um.Dosis,
-           um.Instrucciones,
-           h.Hora,
-           h.Lunes, h.Martes, h.Miercoles, h.Jueves, h.Viernes, h.Sabado, h.Domingo
-    FROM dbo.UsuarioMedicacion AS um
-    JOIN dbo.Medicamentos      AS m  ON m.MedicamentoID = um.MedicamentoID
-    JOIN dbo.UsuarioMedicacionHorario AS h ON h.UsuarioMedicacionID = um.UsuarioMedicacionID
-    JOIN dbo.Usuarios          AS u  ON u.UsuarioID = um.UsuarioID
-    WHERE um.UsuarioID = ?
-      AND um.Activo = 1
-      AND h.Activo = 1
-      AND (CASE ?
-            WHEN 'Lunes'     THEN h.Lunes
-            WHEN 'Martes'    THEN h.Martes
-            WHEN 'Miercoles' THEN h.Miercoles
-            WHEN 'Jueves'    THEN h.Jueves
-            WHEN 'Viernes'   THEN h.Viernes
-            WHEN 'Sabado'    THEN h.Sabado
-            WHEN 'Domingo'   THEN h.Domingo
-          END) = 1
+    sql = """
+    SELECT
+        NombreMedicamento,
+        Dosis,
+        Instrucciones,
+        FechaInicio,
+        FechaHasta,
+        Lunes, Martes, Miercoles, Jueves, Viernes, Sabado, Domingo,
+        Activo,
+        HoraToma
+    FROM dbo.Medicamentos
+    WHERE UsuarioID = ?
     """
-
     try:
         with get_connection() as conn:
             cur = conn.cursor()
-            cur.execute(sql, (usuario_id, day_col))
-            rows = cur.fetchall()
+            rows = cur.execute(sql, (usuario_id,)).fetchall()
     except pyodbc.Error as e:
         print(f"[DB:get_due_meds] SQL error: {e}")
         return []
 
+    today = now_local.date()
     for r in rows:
-        diff = abs(_time_to_minutes(r.Hora) - now_min)
-        if diff <= window_min:
-            items.append({
-                "usuario_nombre": getattr(r, "UsuarioNombre", None),
-                "medicamento": r.Medicamento,
-                "dosis": getattr(r, "Dosis", None),
-                "instrucciones": getattr(r, "Instrucciones", None),
-                "hora": r.Hora.strftime("%H:%M"),
-            })
+        # Activo
+        try:
+            if r.Activo is not None and int(r.Activo) == 0:
+                continue
+        except Exception:
+            pass
+
+        # Rango de fechas (permitir nulos)
+        fi = getattr(r, "FechaInicio", None)
+        fh = getattr(r, "FechaHasta", None)
+        if isinstance(fi, datetime.datetime):
+            fi = fi.date()
+        if isinstance(fh, datetime.datetime):
+            fh = fh.date()
+        if fi and today < fi:
+            continue
+        if fh and today > fh:
+            continue
+
+        # Día de semana
+        if not getattr(r, day_col, False):
+            continue
+
+        # Hora en ventana
+        ht = getattr(r, "HoraToma", None)
+        if not isinstance(ht, time):
+            continue
+        if abs(_time_to_minutes(ht) - now_min) > window_min:
+            continue
+
+        items.append({
+            "usuario_nombre": None,
+            "medicamento": getattr(r, "NombreMedicamento", "") or "",
+            "dosis": getattr(r, "Dosis", None),
+            "instrucciones": getattr(r, "Instrucciones", None),
+            "hora": ht.strftime("%H:%M"),
+        })
 
     return items
-
 
 # -------------------------------------------------------------------
 # Listado completo de medicamentos por usuario (tabla dbo.Medicamentos)
@@ -200,7 +213,7 @@ def get_all_meds(usuario_id: int) -> list[dict]:
             # hora -> HH:mm
             if rec.get("HoraToma"):
                 ht = rec["HoraToma"]
-                if isinstance(ht, datetime.time):
+                if isinstance(ht, time):
                     rec["HoraToma"] = ht.strftime("%H:%M")
                 else:
                     rec["HoraToma"] = str(ht)
